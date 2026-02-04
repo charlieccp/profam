@@ -1,0 +1,13 @@
+(start interactive shell with gpu)
+srun --pty --gres=gpu:1 --cpus-per-task=4 --mem=16G --time=02:00:00 bash -l
+
+(start interactive shell without gpu)
+srun --partition=zen4 --pty --time=02:00:00 bash -l
+
+module load torchvision/0.21.0-foss-2024a-CUDA-12.6.0
+module load SciPy-bundle/2024.05-gfbf-2024a
+module load Biopython/1.84-gfbf-2024a
+module load matplotlib/3.9.2-gfbf-2024a
+
+source venv-profam/bin/activate
+(the env is saved in $SCRATCH)

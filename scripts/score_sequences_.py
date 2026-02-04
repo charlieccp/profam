@@ -48,9 +48,9 @@ def build_pool_from_fasta(path: str) -> ProteinDocument:
 def score_variants_ensemble(
     model: LlamaLitModule,
     completion_ids: torch.Tensor,
+    tokenized_conditioning_sequences: List[List[int]],
+    ensemble_size: int,
     scoring_max_tokens: int,
-    tokenized_conditioning_sequences: Optional[List[int]]= None,
-    ensemble_size: Optional[int] = None,
     start_tokens: Optional[list[int]] = None,
     max_tokens_override: Optional[int] = None,
     weights: Optional[np.ndarray] = None,
@@ -66,10 +66,7 @@ def score_variants_ensemble(
     rng_np = np.random.default_rng(42)
 
     # Pre-calculate stats
-    if tokenized_conditioning_sequences:
-        seq_lengths = [len(seq) for seq in tokenized_conditioning_sequences]
-    else:
-        seq_lengths = []
+    seq_lengths = [len(seq) for seq in tokenized_conditioning_sequences]
     total_seqs = len(seq_lengths)
     completion_length = completion_ids.shape[-1]
 
@@ -100,7 +97,6 @@ def score_variants_ensemble(
     variant_lls: List[np.ndarray] = []
     all_lls_per_pos: List[np.ndarray] = []
     token_count_attempts = 100
-    n_opt_list = []
 
     if completion_length + 2 > max_tokens:
         n_opt = 0
@@ -171,9 +167,7 @@ def score_variants_ensemble(
 
         completion_ids_device = completion_ids.to(model.device)
 
-        n_opt_list.append(str(n_opt))
-
-        lls, lls_per_pos = model.score_seqs(
+        lls,lls_per_pos = model.score_seqs(
             input_ids,
             completion_ids_device,
             use_cache=getattr(model, "use_kv_cache_for_scoring", True),
@@ -183,32 +177,22 @@ def score_variants_ensemble(
             )
             if getattr(model, "use_kv_cache_for_scoring", True)
             else 1,
-            return_per_pos=True,
         )
-
-        variant_lls.append(lls)
         all_lls_per_pos.append(lls_per_pos)
+        variant_lls.append(lls)
         n_seqs_list.append(n_opt)
 
         if len(vals_in_range) > 0:
             n_opt = rng.choice(vals_in_range)
 
-    lls_array = np.stack(variant_lls, axis=0)  # (repeats, n_mutants)
-    lls_per_pos_array = np.stack(all_lls_per_pos, axis=0)  # (repeats, n_mutants, L-1)
 
-    # Return per-sequence mean log-likelihood across variants
-    mean_lls_per_sequence = lls_array.mean(axis=0)  # (n_mutants,)
+    lls_array = torch.stack(variant_lls, dim=0)                 # (repeats, n_mutants)
+    all_lls_per_pos_array = torch.stack(all_lls_per_pos, dim=0) # (repeats, n_mutants, L-1)
 
-    # Mean per-position log-likelihood across variants, per mutant
-    mean_lls_per_pos = lls_per_pos_array.mean(axis=0)  # (n_mutants, L-1)
+    mean_lls_per_sequence = lls_array.mean(dim=0)               # (n_mutants,)
+    mean_lls_per_pos_Lm1 = all_lls_per_pos_array.mean(dim=(0,1))# (L-1,)
 
-    # With BOS/EOS=[SEP], completion tokens are: [SEP] + AAs + [SEP]
-    # score_seqs returns per-position log-likelihood for tokens 1..L-1, i.e. AAs + EOS.
-    # Drop the final EOS token so columns align with amino-acid positions.
-    # if mean_lls_per_pos.shape[-1] >= 1:
-    #     mean_lls_per_pos = mean_lls_per_pos[:, :-1]  # (n_mutants, L_seq)
-
-    return mean_lls_per_sequence, mean_lls_per_pos, n_opt_list
+    return mean_lls_per_sequence, mean_lls_per_pos_Lm1
 
 
 def main():
@@ -221,16 +205,10 @@ def main():
         default="model_checkpoints/profam-1",
         help="Checkpoint run directory (contains checkpoints/last.ckpt)",
     )
-    # parser.add_argument(
-    #     "--conditioning_fasta",
-    #     type=str,
-    #     default="data/score_sequences_example/CCDB_ECOLI_Adkar_2012.a3m",
-    #     help="Path to conditioning FASTA/MSA file",
-    # )
     parser.add_argument(
         "--conditioning_fasta",
         type=str,
-        default=None,
+        default="data/score_sequences_example/CCDB_ECOLI_Adkar_2012.a3m",
         help="Path to conditioning FASTA/MSA file",
     )
     parser.add_argument(
@@ -270,7 +248,7 @@ def main():
     parser.add_argument(
         "--ensemble_number",
         type=int,
-        default=None,
+        default=3,
         help="Number of prompts used to generate the ensemble score",
     )
     parser.add_argument(
@@ -345,8 +323,11 @@ def main():
     }
     model.to(args.device, dtype=dtype_map[args.dtype])
 
+    # Build ProteinDocument objects (just to read sequences nicely)
+    cond_doc = build_pool_from_fasta(args.conditioning_fasta)
+
     weights = None
-    if args.use_diversity_weights and args.conditioning_fasta:
+    if args.use_diversity_weights:
         print(
             f"Computing diversity (homology) weights for {args.conditioning_fasta}...",
             file=sys.stderr,
@@ -364,24 +345,19 @@ def main():
             force_recalc=args.recompute_diversity_weights,
         )
 
-    # Build ProteinDocument objects (just to read sequences nicely)
-    len_cond_doc = None
-    if args.conditioning_fasta:
-        cond_doc = build_pool_from_fasta(args.conditioning_fasta)
-        # Tokenize conditioning sequences individually
-        print(
-            f"Tokenizing {len(cond_doc.sequences)} conditioning sequences...",
-            file=sys.stderr,
-        )
-        # Using the tokenizer directly on strings to get IDs.
-        # NOTE: verify if we need spaces or not. The tokenizer in debug worked on "ACDEFGH".
-        tokenized_conditioning_sequences = [
-            model.tokenizer(
-                seq.upper().replace("-", "").replace(".", ""), add_special_tokens=False
-            )["input_ids"]
-            for seq in cond_doc.sequences
-        ]
-        len_cond_doc = len(cond_doc.sequences)
+    # Tokenize conditioning sequences individually
+    print(
+        f"Tokenizing {len(cond_doc.sequences)} conditioning sequences...",
+        file=sys.stderr,
+    )
+    # Using the tokenizer directly on strings to get IDs.
+    # NOTE: verify if we need spaces or not. The tokenizer in debug worked on "ACDEFGH".
+    tokenized_conditioning_sequences = [
+        model.tokenizer(
+            seq.upper().replace("-", "").replace(".", ""), add_special_tokens=False
+        )["input_ids"]
+        for seq in cond_doc.sequences
+    ]
 
     # Read candidates
     dms_scores = None
@@ -420,54 +396,45 @@ def main():
     )  # (1, n, L)
 
     with torch.no_grad():
-        if args.conditioning_fasta:
-            lls, lls_per_pos, n_opt_list = score_variants_ensemble(
-                model=model,
-                completion_ids=completion_ids,
-                scoring_max_tokens=args.scoring_max_tokens,
-                tokenized_conditioning_sequences=tokenized_conditioning_sequences,
-                ensemble_size=args.ensemble_number,
-                start_tokens=[47, 63],
-                max_tokens_override=args.max_tokens,
-                weights=weights,
-            )
-        else:
-            lls, lls_per_pos, n_opt_list = score_variants_ensemble(
-                model=model,
-                completion_ids=completion_ids,
-                scoring_max_tokens=args.scoring_max_tokens,
-                start_tokens=[47, 63],
-                max_tokens_override=args.max_tokens,
-            )
+        lls, mean_lls_per_pos_L = score_variants_ensemble(
+            model=model,
+            completion_ids=completion_ids,
+            tokenized_conditioning_sequences=tokenized_conditioning_sequences,
+            ensemble_size=args.ensemble_number,
+            scoring_max_tokens=args.scoring_max_tokens,
+            start_tokens=[47, 63],
+            max_tokens_override=args.max_tokens,
+            weights=weights,
+        )
 
     # Output handling
     os.makedirs(args.save_dir, exist_ok=True)
     candidate_basename = os.path.splitext(os.path.basename(args.candidates_file))[0]
 
-    csv_path = os.path.join(args.save_dir, f"{candidate_basename}_scores.csv")
+    csv_path_lls = os.path.join(args.save_dir, f"{candidate_basename}_scores.csv")
+    csv_path_lls_per_pos = os.path.join(args.save_dir, f"{candidate_basename}_scores_per_pos.csv")
     json_path = os.path.join(args.save_dir, f"{candidate_basename}_metadata.json")
+
+    values = mean_lls_per_pos_L.detach().float().cpu().numpy()
+    positions = np.arange(1, len(values) + 1)  # positions 1..L-1
+
+    df = pd.DataFrame({
+        "position": positions,
+        "mean_log_likelihood": values,
+    })
+
+    df.to_csv(csv_path_lls_per_pos, index=False)
 
     df_out = pd.DataFrame(
         {"id": cand_names, "mutated_sequence": cand_seqs, "score": lls.tolist()}
     )
     if dms_scores is not None:
         df_out["DMS_score"] = dms_scores
-    df_out.to_csv(csv_path, index=False)
+    df_out.to_csv(csv_path_lls, index=False)
 
-    # Save per-position mean log-likelihood per mutant.
-    # lls_per_pos has shape (n_mutants, L_seq) where L_seq == len(mutated_sequence).
-    for ll_per_pos, cand in zip(lls_per_pos,cand_names):
 
-        df = pd.DataFrame({
-            "position": [i+1 for i in range(len(ll_per_pos))],
-            "mean_log_likelihood": ll_per_pos,
-        })
-
-        os.makedirs(os.path.join(args.save_dir, "ll_per_pos_per_cand"), exist_ok=True)
-        per_pos_csv_path = os.path.join(args.save_dir, "ll_per_pos_per_cand", f"{cand}_per_pos_ll.csv")
-        df.to_csv(per_pos_csv_path, index=False)
-
-    print(f"Scores saved to {csv_path}...")
+    print(df_out[["id", "mutated_sequence", "score"]].to_csv(index=False))
+    print(f"Scores saved to {csv_path_lls}...")
 
     # Calculate metrics
     corr = None
@@ -475,16 +442,14 @@ def main():
         corr, _ = spearmanr(lls, dms_scores)
         print(f"Spearman correlation: {corr}", file=sys.stderr)
 
-    print(n_opt_list)
     metadata = {
         "n_sequences_evaluated": len(cand_seqs),
         "ensemble_number": args.ensemble_number,
         "timestamp": datetime.now().isoformat(),
         "conditioning_fasta": args.conditioning_fasta,
-        # "n_conditioning_sequences": int(len_cond_doc) if len_cond_doc is not None else None,
-        "n_conditioning_sequences":",".join(n_opt_list),
+        "n_conditioning_sequences": len(cond_doc.sequences),
         "candidates_file": args.candidates_file,
-        "mean_likelihood_score": float(np.mean(lls)),
+        "mean_likelihood_score": float(lls),
         "spearman_correlation": float(corr) if corr is not None else None,
         "checkpoint": args.checkpoint_dir,
     }

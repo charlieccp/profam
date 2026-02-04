@@ -433,14 +433,13 @@ class BaseFamilyLitModule(LightningModule):
         completion_ids,
         batch_size: int = 1,
         verbose: bool = False,
-        return_per_pos: bool = False,
     ):
         # input_ids is b, L; completion_ids is b, n, L
         # https://huggingface.co/docs/transformers/main/en/llm_tutorial_optimization
         # https://github.com/huggingface/transformers/blob/b7672826cad31e30319487af876e608d8af7d37b/src/transformers/generation/utils.py#L1879
         # https://github.com/huggingface/transformers/blob/67a4ef89d4ddbfd7d61e479359a1b609e5ee9843/src/transformers/models/mistral/modeling_mistral.py#L1233
         all_lls = []
-        all_lls_per_pos: List[torch.Tensor] = []
+        all_lls_per_pos = []
         assert (
             input_ids[0, 0] == self.tokenizer.vocab["[start-of-document]"]
             and input_ids[0, 1] > 19
@@ -464,14 +463,9 @@ class BaseFamilyLitModule(LightningModule):
                 :, batch_start: batch_start + batch_size
             ].reshape(-1, L)  # b_mut, L
             # fmt: on
-
-            # Keep original length so we can return a consistent per-position shape
-            # even if we trim padding for efficiency.
-            L_orig = this_input_ids.shape[-1]
-
             # remove unnecessary padding:
             this_input_ids = self.trim_eval_batch(this_input_ids)
-            L_trim = this_input_ids.shape[-1]
+            L_mini_batch = this_input_ids.shape[-1]
 
             actual_batch_size = this_input_ids.shape[0]
             cache = InputAwareDynamicCache.from_legacy_cache(past_key_values)
@@ -496,25 +490,40 @@ class BaseFamilyLitModule(LightningModule):
                 log_likelihood.device
             )  # aligns with start_ix=0
             mask = shift_labels != -100
+            
+            # exclude SEP / EOS (and anything else you consider non-AA)
+            special = {self.tokenizer.sep_token_id}
+            eos = getattr(self.tokenizer, "eos_token_id", None)
+            if eos is not None:
+                special.add(eos)
+
+            for sid in special:
+                mask = mask & (shift_labels != sid)
+
+            per_pos = log_likelihood.float().masked_fill(~mask, float("nan"))
+
             denom = mask.sum(dim=-1).clamp(min=1)
             ll_mean = (log_likelihood * mask).sum(dim=-1) / denom
             all_lls.append(ll_mean)  # b_mut
 
-            if return_per_pos:
-                # log_likelihood is aligned with labels[..., 1:], i.e. length (L_trim - 1)
-                # We pad back to (L_orig - 1) so batches with different trimmed lengths
-                # can be concatenated safely.
-                ll_pos = (log_likelihood * mask).to(torch.float32)  # (b_mut, L_trim-1)
-                if ll_pos.shape[-1] < (L_orig - 1):
-                    pad_len = (L_orig - 1) - ll_pos.shape[-1]
-                    ll_pos = F.pad(ll_pos, (0, pad_len), value=0.0)
-                all_lls_per_pos.append(ll_pos)
+            # per-position, masked with NaN and padded to (L-1)
+            per_pos = log_likelihood.masked_fill(~mask, float("nan"))      # (B, Lm-1)
+            target_len = L - 1
+            cur_len = per_pos.shape[1]
+            if cur_len < target_len:
+                pad = torch.full(
+                    (per_pos.shape[0], target_len - cur_len),
+                    float("nan"),
+                    device=per_pos.device,
+                    dtype=per_pos.dtype,
+                )
+                per_pos = torch.cat([per_pos, pad], dim=1)
 
-        lls = torch.cat(all_lls).cpu().float().numpy()
-        if return_per_pos:
-            lls_per_pos = torch.cat(all_lls_per_pos, dim=0).cpu().float().numpy()
-            return lls, lls_per_pos
-        return lls
+            all_lls_per_pos.append(per_pos)
+
+        lls = torch.cat(all_lls, dim=0)                 # (n_mutants,)
+        lls_per_pos = torch.cat(all_lls_per_pos, dim=0) # (n_mutants, L-1)
+        return lls.detach(), lls_per_pos.detach()
 
     def _score_seqs_no_cache(
         self,
@@ -522,7 +531,6 @@ class BaseFamilyLitModule(LightningModule):
         completion_ids,
         batch_size: int = 1,
         verbose: bool = False,
-        return_per_pos: bool = False,
     ):
         # input_ids is b, L; completion_ids is b, n, L
         if batch_size > 1:
@@ -530,7 +538,6 @@ class BaseFamilyLitModule(LightningModule):
                 "Mutant batch size > 1 not yet supported for mutant scoring"
             )
         all_lls = []
-        all_lls_per_pos: List[torch.Tensor] = []
         likelihood_start_ix = input_ids.shape[1]
         for completion_ix in tqdm.tqdm(
             range(completion_ids.shape[1]), disable=not verbose
@@ -564,19 +571,7 @@ class BaseFamilyLitModule(LightningModule):
             denom = mask.sum(dim=-1).clamp(min=1)
             ll_mean = (log_likelihood * mask).sum(dim=-1) / denom
             all_lls.append(ll_mean.item())
-
-            if return_per_pos:
-                ll_pos = (log_likelihood * mask).to(torch.float32)  # (1, L_comp-1)
-                # Ensure consistent width = completion_length - 1
-                # (completion_ids includes BOS/EOS; log_likelihood excludes first completion token).
-                L_comp = completion_ids.shape[-1]
-                if ll_pos.shape[-1] < (L_comp - 1):
-                    ll_pos = F.pad(ll_pos, (0, (L_comp - 1) - ll_pos.shape[-1]), value=0.0)
-                all_lls_per_pos.append(ll_pos.squeeze(0))
         lls = np.array(all_lls)
-        if return_per_pos:
-            lls_per_pos = torch.stack(all_lls_per_pos, dim=0).cpu().float().numpy()
-            return lls, lls_per_pos
         return lls
 
     def _score_seqs_no_context(
@@ -585,7 +580,6 @@ class BaseFamilyLitModule(LightningModule):
         batch_size: int = 1,
         verbose: bool = False,
         start_tokens: list[int] = [47, 63],
-        return_per_pos: bool = False,
     ):
         if len(completion_ids.shape) == 3:
             completion_ids = completion_ids.squeeze(0)
@@ -602,7 +596,6 @@ class BaseFamilyLitModule(LightningModule):
             )
             completion_ids = torch.cat([start_tokens_tensor, completion_ids], dim=-1)
         all_lls = []
-        all_lls_per_pos: List[torch.Tensor] = []
         for completion_ix in tqdm.tqdm(
             range(0, completion_ids.shape[0], batch_size), disable=not verbose
         ):
@@ -624,23 +617,7 @@ class BaseFamilyLitModule(LightningModule):
             ll_mean = (log_likelihood * mask).sum(dim=-1) / denom
             all_lls.append(ll_mean)
 
-            if return_per_pos:
-                # Here start_ix=1 -> log_likelihood aligns with labels[..., 2:]
-                ll_pos = (log_likelihood * mask).to(torch.float32)
-                # Pad back to a consistent width (sequence_length - 2)
-                # because we may have trimmed padding.
-                # `this_input_ids` here does not include an external prompt.
-                # When using start_tokens, the first score corresponds to the
-                # first token after the two start tokens.
-                # We keep the raw width for this minibatch.
-                all_lls_per_pos.append(ll_pos)
-
         lls = torch.cat(all_lls).cpu().float().numpy()
-        if return_per_pos:
-            # This path is rarely used for mutant scoring; best-effort concat.
-            # Note: sequences of different lengths will yield different widths.
-            lls_per_pos = torch.cat(all_lls_per_pos, dim=0).cpu().float().numpy()
-            return lls, lls_per_pos
         return lls
 
     def score_seqs(
@@ -649,7 +626,6 @@ class BaseFamilyLitModule(LightningModule):
         completion_ids,
         use_cache: bool = True,
         batch_size: int = 1,
-        return_per_pos: bool = False,
     ):
         if input_ids is not None:
             assert (
@@ -663,20 +639,17 @@ class BaseFamilyLitModule(LightningModule):
                     input_ids,
                     completion_ids,
                     batch_size=batch_size,
-                    return_per_pos=return_per_pos,
                 )
             else:
                 return self._score_seqs_no_cache(
                     input_ids,
                     completion_ids,
                     batch_size=batch_size,
-                    return_per_pos=return_per_pos,
                 )
         else:
             return self._score_seqs_no_context(
                 completion_ids,
                 batch_size=batch_size,
-                return_per_pos=return_per_pos,
             )
 
     def _sample_seqs(
