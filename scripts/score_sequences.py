@@ -21,6 +21,10 @@ Inputs: conditioning_sequences.fasta, candidate_sequences.fasta or .csv
 Outputs: prints per-sequence mean log-likelihoods to stdout as CSV
 """
 
+"""
+Some implementations/fixes added by Charlotte Crauwels
+"""
+
 from src.data.msa_subsampling import compute_homology_sequence_weights_with_cache
 from src.data.objects import ProteinDocument
 from src.models.llama import LlamaLitModule
