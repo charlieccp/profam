@@ -193,20 +193,14 @@ def score_variants_ensemble(
         if len(vals_in_range) > 0:
             n_opt = rng.choice(vals_in_range)
 
-    lls_array = np.stack(variant_lls, axis=0)  # (repeats, n_mutants)
-    lls_per_pos_array = np.stack(all_lls_per_pos, axis=0)  # (repeats, n_mutants, L-1)
+    lls_array = np.stack(variant_lls, axis=0)
+    lls_per_pos_array = np.stack(all_lls_per_pos, axis=0)
 
     # Return per-sequence mean log-likelihood across variants
-    mean_lls_per_sequence = lls_array.mean(axis=0)  # (n_mutants,)
+    mean_lls_per_sequence = lls_array.mean(axis=0)
 
     # Mean per-position log-likelihood across variants, per mutant
-    mean_lls_per_pos = lls_per_pos_array.mean(axis=0)  # (n_mutants, L-1)
-
-    # With BOS/EOS=[SEP], completion tokens are: [SEP] + AAs + [SEP]
-    # score_seqs returns per-position log-likelihood for tokens 1..L-1, i.e. AAs + EOS.
-    # Drop the final EOS token so columns align with amino-acid positions.
-    # if mean_lls_per_pos.shape[-1] >= 1:
-    #     mean_lls_per_pos = mean_lls_per_pos[:, :-1]  # (n_mutants, L_seq)
+    mean_lls_per_pos = lls_per_pos_array.mean(axis=0)
 
     return mean_lls_per_sequence, mean_lls_per_pos, n_opt_list
 
