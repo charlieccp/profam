@@ -134,6 +134,7 @@ def beam_search_chimera_template(
     max_tokens_override: int = 8192,
     start_tokens: Optional[List[int]] = None,
     weights: Optional[np.ndarray] = None,
+    margin: Optional[float] = None
 ) -> List[Tuple[str, float, float, int]]:
     """
     Supports empty options at '_' holes:
@@ -161,7 +162,7 @@ def beam_search_chimera_template(
             if len(opt) != 1:
                 raise ValueError(f"Options at pos {pos} must be single residues or empty, got {opt!r}")
 
-    beams: List[Beam] = [Beam(seq="", score=0.0,score_pos=0.0, n_switched=False, c_switched=False, emitted_len=0)]
+    beams: List[Beam] = [Beam(seq="", score=0.0,score_pos=0.0, n_switched=False, c_switched=False, emitted_len=0)] 
 
     with open(f"beam_trace_{name}.jsonl", "w") as trace_f:
         for pos in range(L):
@@ -198,11 +199,10 @@ def beam_search_chimera_template(
             if not expansions:
                 raise RuntimeError(f"No valid expansions at position {pos} under the prior.")
 
-
-            # Score only the expansions that emitted a residue
-
+            # Score only expansions that emitted a residue
             emit_indices = [i for i, (_, _, _, emitted) in enumerate(expansions) if emitted is not None]
             emit_seqs = [expansions[i][1] for i in emit_indices]
+
             emit_ll = None
             if emit_seqs:
                 emit_ll = _score_last_residue_lls(
@@ -215,51 +215,96 @@ def beam_search_chimera_template(
                     start_tokens=[47, 63],
                     weights=weights,
                 )
-            save_step_jsonl(trace_f, pos, expansions, emit_indices, emit_ll)
-            # Build new beams
+
+            # Build ll aligned to expansions (same length as expansions)
+            ll_by_exp = np.full(len(expansions), np.nan, dtype=float)
+            if emit_ll is not None:
+                for j, exp_i in enumerate(emit_indices):
+                    ll_by_exp[exp_i] = float(emit_ll[j])
+
+            # Optional margin filtering (per previous beam, only at '_' positions)
+            keep_mask = np.ones(len(expansions), dtype=bool)
+
+            if margin is not None:
+                by_prev = {}
+                for i, (prev, _, picked_parent, emitted) in enumerate(expansions):
+                    if picked_parent is None:
+                        continue  # fixed position
+                    # only margin-compare among options that actually emitted (have a ll)
+                    if emitted is None:
+                        continue
+                    by_prev.setdefault(id(prev), []).append(i)
+
+                for _, idxs in by_prev.items():
+                    best = float(np.nanmax(ll_by_exp[idxs]))
+                    for i in idxs:
+                        if best - ll_by_exp[i] > float(margin):
+                            keep_mask[i] = False
+
+            # Save trace
+            save_step_jsonl(trace_f, pos, expansions, emit_indices, emit_ll,keep_mask)
+
+            # Build new beams from kept expansions
             new_beams: List[Beam] = []
-            emit_cursor = 0
+            emit_cursor = 0 
+
             for i, (prev, new_seq, picked_parent, emitted) in enumerate(expansions):
-                # update switch flags only when there was a choice (picked_parent != None)
+                if not keep_mask[i]:
+                    continue
+
                 if picked_parent is None:
                     n_sw, c_sw = prev.n_switched, prev.c_switched
                 else:
                     n_sw, c_sw = _update_switch_flags(pos, picked_parent, prev, nterm_positions, cterm_positions)
 
                 if emitted is None:
-                    # deletion: no score added, emitted_len unchanged
+                    # fixed residue (you currently treat as emitted=None) OR deletion -> no score
                     new_beams.append(
-                        Beam(seq=new_seq, score=prev.score, score_pos=prev.score, n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len)
+                        Beam(seq=new_seq, score=prev.score, score_pos=0.0,
+                            n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len)
                     )
                 else:
                     ll = float(emit_ll[emit_cursor])
                     emit_cursor += 1
                     new_beams.append(
-                        Beam(
-                            seq=new_seq,
-                            score=prev.score + ll,
-                            score_pos = ll,
-                            n_switched=n_sw,
-                            c_switched=c_sw,
-                            emitted_len=prev.emitted_len + 1,
-                        )
+                        Beam(seq=new_seq, score=prev.score + ll, score_pos=ll,
+                            n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len + 1)
                     )
+
+            # Fallback: if everything filtered out, do NOT dead-end
+            if not new_beams:
+                new_beams = []
+                emit_cursor = 0
+                for i, (prev, new_seq, picked_parent, emitted) in enumerate(expansions):
+                    if picked_parent is None:
+                        n_sw, c_sw = prev.n_switched, prev.c_switched
+                    else:
+                        n_sw, c_sw = _update_switch_flags(pos, picked_parent, prev, nterm_positions, cterm_positions)
+
+                    if emitted is None:
+                        new_beams.append(
+                            Beam(seq=new_seq, score=prev.score, score_pos=0.0,
+                                n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len)
+                        )
+                    else:
+                        ll = float(emit_ll[emit_cursor])
+                        emit_cursor += 1
+                        new_beams.append(
+                            Beam(seq=new_seq, score=prev.score + ll, score_pos=ll,
+                                n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len + 1)
+                        )
+
             beams = new_beams
-        #     # Prune: rank beams during search
-        #     new_beams.sort(key=lambda x: (x.score / max(1, x.emitted_len)), reverse=True)
-        #     beams = new_beams[:beam_width]
 
-    # # Final ranking
-    # out = []
-    # for b in beams:
-    #     avg = b.score / max(1, b.emitted_len)
-    #     out.append((b.seq, b.score, avg, b.emitted_len))
+    # Final ranking
+    out = []
+    for b in beams:
+        avg = b.score / max(1, b.emitted_len)
+        out.append((b.seq, b.score, avg, b.emitted_len))
 
 
-    # out.sort(key=lambda x: x[2], reverse=True)  # average per emitted residue
-    # return out
-    
-    return
+    out.sort(key=lambda x: x[2], reverse=True)  # average per emitted residue
+    return out
 
 
 def main():
