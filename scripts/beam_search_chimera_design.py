@@ -11,7 +11,8 @@ import numpy as np
 import pandas as pd
 import torch
 from dataclasses import dataclass
-from score_sequences import score_variants_ensemble
+
+from scripts.score_sequences import score_variants_ensemble
 
 """
 Script to generate 'best' chimeric sequences using a beam search.
@@ -22,6 +23,7 @@ The best chimeras is those with the highest conditional likelihood scores.
 class Beam:
     seq: str
     score: float
+    score_pos : float
     n_switched: bool
     c_switched: bool
     emitted_len: int  # number of residues actually emitted/scored
@@ -92,10 +94,35 @@ def _score_last_residue_lls(
 
     return mean_lls_per_pos[:, -2].astype(np.float64)
 
+import json
+
+def save_step_jsonl(f, pos, expansions, emit_indices, emit_ll):
+    # Make expansions JSON-friendly (Beam object -> dict)
+    exp_rows = []
+    for (prev, new_seq, picked_parent, emitted) in expansions:
+        exp_rows.append({
+            "prev_seq": getattr(prev, "seq", None),
+            "prev_score": getattr(prev, "score", None),
+            "prev_emitted_len": getattr(prev, "emitted_len", None),
+            "new_seq": new_seq,
+            "picked_parent": picked_parent,
+            "emitted": emitted,
+        })
+
+    rec = {
+        "pos": pos,
+        "expansions": exp_rows,
+        "emit_indices": emit_indices,
+        "emit_ll": None if emit_ll is None else [float(x) for x in emit_ll],
+    }
+    f.write(json.dumps(rec) + "\n")
+    f.flush()
+
 
 def beam_search_chimera_template(
     *,
     model,
+    name: str,
     chimera_template: str,
     hole_options: Dict[int, Tuple[Union[str, None], Union[str, None]]],
     beam_width: int = 16,
@@ -134,99 +161,105 @@ def beam_search_chimera_template(
             if len(opt) != 1:
                 raise ValueError(f"Options at pos {pos} must be single residues or empty, got {opt!r}")
 
-    beams: List[Beam] = [Beam(seq="", score=0.0, n_switched=False, c_switched=False, emitted_len=0)]
+    beams: List[Beam] = [Beam(seq="", score=0.0,score_pos=0.0, n_switched=False, c_switched=False, emitted_len=0)]
 
-    for pos in range(L):
-        template_char = chimera_template[pos]
+    with open(f"beam_trace_{name}.jsonl", "w") as trace_f:
+        for pos in range(L):
+            template_char = chimera_template[pos]
 
-        # expansions entries:
-        # (prev_beam, new_seq, picked_parent, emitted_residue_or_none)
-        expansions: List[Tuple[Beam, str, Optional[str], Optional[str]]] = []
+            # expansions entries:
+            # (prev_beam, new_seq, picked_parent, emitted_residue_or_none)
+            expansions: List[Tuple[Beam, str, Optional[str], Optional[str]]] = []
 
-        if template_char != "_":
-            # Fixed residue: always emit and score
-            for b in beams:
-                expansions.append((b, b.seq + template_char, None, template_char))
-        else:
-            # Hole: choose option A or B, either can be residue or empty
-            optA, optB = hole_options[pos]
-            for b in beams:
-                allow_A, allow_B = _allowed_parent_choices(pos, b, nterm_positions, cterm_positions)
-
-                if allow_A:
-                    if optA is None:
-                        expansions.append((b, b.seq, "A", None))       # deletion
-                    else:
-                        expansions.append((b, b.seq + optA, "A", optA))  # emit residue
-
-                if allow_B:
-                    if optB is None:
-                        expansions.append((b, b.seq, "B", None))
-                    else:
-                        expansions.append((b, b.seq + optB, "B", optB))
-
-        if not expansions:
-            raise RuntimeError(f"No valid expansions at position {pos} under the prior.")
-
-        # Score only the expansions that emitted a residue
-        emit_indices = [i for i, (_, _, _, emitted) in enumerate(expansions) if emitted is not None]
-        emit_seqs = [expansions[i][1] for i in emit_indices]
-
-        emit_ll = None
-        if emit_seqs:
-            emit_ll = _score_last_residue_lls(
-                model,
-                emit_seqs,
-                tokenized_conditioning_sequences=tokenized_conditioning_sequences,
-                ensemble_size=ensemble_size,
-                scoring_max_tokens=scoring_max_tokens,
-                max_tokens_override=max_tokens_override,
-                start_tokens=[47, 63],
-                weights=weights,
-            )
-
-        # Build new beams
-        new_beams: List[Beam] = []
-        emit_cursor = 0
-        for i, (prev, new_seq, picked_parent, emitted) in enumerate(expansions):
-            # update switch flags only when there was a choice (picked_parent != None)
-            if picked_parent is None:
-                n_sw, c_sw = prev.n_switched, prev.c_switched
+            if template_char != "_":
+                # Fixed residue: always emit and score
+                # for b in beams:
+                #     expansions.append((b, b.seq + template_char, None, template_char))
+                for b in beams:
+                    expansions.append((b, b.seq + template_char, None, None))
             else:
-                n_sw, c_sw = _update_switch_flags(pos, picked_parent, prev, nterm_positions, cterm_positions)
+                # Hole: choose option A or B, either can be residue or empty
+                optA, optB = hole_options[pos]
+                for b in beams:
+                    allow_A, allow_B = _allowed_parent_choices(pos, b, nterm_positions, cterm_positions)
 
-            if emitted is None:
-                # deletion: no score added, emitted_len unchanged
-                new_beams.append(
-                    Beam(seq=new_seq, score=prev.score, n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len)
+                    if allow_A:
+                        if optA is None:
+                            expansions.append((b, b.seq, "A", None))       # deletion
+                        else:
+                            expansions.append((b, b.seq + optA, "A", optA))  # emit residue
+
+                    if allow_B:
+                        if optB is None:
+                            expansions.append((b, b.seq, "B", None))
+                        else:
+                            expansions.append((b, b.seq + optB, "B", optB))
+
+            if not expansions:
+                raise RuntimeError(f"No valid expansions at position {pos} under the prior.")
+
+
+            # Score only the expansions that emitted a residue
+
+            emit_indices = [i for i, (_, _, _, emitted) in enumerate(expansions) if emitted is not None]
+            emit_seqs = [expansions[i][1] for i in emit_indices]
+            emit_ll = None
+            if emit_seqs:
+                emit_ll = _score_last_residue_lls(
+                    model,
+                    emit_seqs,
+                    tokenized_conditioning_sequences=tokenized_conditioning_sequences,
+                    ensemble_size=ensemble_size,
+                    scoring_max_tokens=scoring_max_tokens,
+                    max_tokens_override=max_tokens_override,
+                    start_tokens=[47, 63],
+                    weights=weights,
                 )
-            else:
-                ll = float(emit_ll[emit_cursor])
-                emit_cursor += 1
-                new_beams.append(
-                    Beam(
-                        seq=new_seq,
-                        score=prev.score + ll,
-                        n_switched=n_sw,
-                        c_switched=c_sw,
-                        emitted_len=prev.emitted_len + 1,
+            save_step_jsonl(trace_f, pos, expansions, emit_indices, emit_ll)
+            # Build new beams
+            new_beams: List[Beam] = []
+            emit_cursor = 0
+            for i, (prev, new_seq, picked_parent, emitted) in enumerate(expansions):
+                # update switch flags only when there was a choice (picked_parent != None)
+                if picked_parent is None:
+                    n_sw, c_sw = prev.n_switched, prev.c_switched
+                else:
+                    n_sw, c_sw = _update_switch_flags(pos, picked_parent, prev, nterm_positions, cterm_positions)
+
+                if emitted is None:
+                    # deletion: no score added, emitted_len unchanged
+                    new_beams.append(
+                        Beam(seq=new_seq, score=prev.score, score_pos=prev.score, n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len)
                     )
-                )
+                else:
+                    ll = float(emit_ll[emit_cursor])
+                    emit_cursor += 1
+                    new_beams.append(
+                        Beam(
+                            seq=new_seq,
+                            score=prev.score + ll,
+                            score_pos = ll,
+                            n_switched=n_sw,
+                            c_switched=c_sw,
+                            emitted_len=prev.emitted_len + 1,
+                        )
+                    )
+            beams = new_beams
+        #     # Prune: rank beams during search
+        #     new_beams.sort(key=lambda x: (x.score / max(1, x.emitted_len)), reverse=True)
+        #     beams = new_beams[:beam_width]
 
-        # Prune: rank beams during search
-        new_beams.sort(key=lambda x: (x.score / max(1, x.emitted_len)), reverse=True)
-        beams = new_beams[:beam_width]
-
-    # Final ranking
-    out = []
-    for b in beams:
-        avg = b.score / max(1, b.emitted_len)
-        out.append((b.seq, b.score, avg, b.emitted_len))
+    # # Final ranking
+    # out = []
+    # for b in beams:
+    #     avg = b.score / max(1, b.emitted_len)
+    #     out.append((b.seq, b.score, avg, b.emitted_len))
 
 
-    out.sort(key=lambda x: x[2], reverse=True)  # average per emitted residue
-
-    return out
+    # out.sort(key=lambda x: x[2], reverse=True)  # average per emitted residue
+    # return out
+    
+    return
 
 
 def main():
@@ -340,7 +373,7 @@ def main():
     )
     args = parser.parse_args()
 
-    seed_all(args.seed)
+    # seed_all(args.seed)
 
     ckpt_path = os.path.join(args.checkpoint_dir, "checkpoints/last.ckpt")
     if not os.path.exists(ckpt_path):
@@ -424,17 +457,17 @@ def main():
         len_cond_doc = len(cond_doc.sequences)
 
     
-    # Encode completions with BOS/EOS = [SEP]
-    comp_tok = model.tokenizer.encode_completions(
-        cand_seqs,
-        bos_token=model.tokenizer.sep_token,
-        eos_token=model.tokenizer.sep_token,
-    )
-    completion_ids = (
-        torch.as_tensor(comp_tok["input_ids"], dtype=torch.long)
-        .unsqueeze(0)
-        .to(model.device)
-    )  # (1, n, L)
+    # # Encode completions with BOS/EOS = [SEP]
+    # comp_tok = model.tokenizer.encode_completions(
+    #     cand_seqs,
+    #     bos_token=model.tokenizer.sep_token,
+    #     eos_token=model.tokenizer.sep_token,
+    # )
+    # completion_ids = (
+    #     torch.as_tensor(comp_tok["input_ids"], dtype=torch.long)
+    #     .unsqueeze(0)
+    #     .to(model.device)
+    # )  # (1, n, L)
 
     with torch.no_grad():
         beam_search_chimera_template(
