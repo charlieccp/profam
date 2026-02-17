@@ -1,36 +1,39 @@
 from __future__ import annotations
 
-import argparse
 import json
-import os
-import sys
-from typing import Dict, List, Optional, Set, Tuple, Union
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import pandas as pd
 import torch
-from dataclasses import dataclass
 
 from scripts.score_sequences import score_variants_ensemble
 
-"""
-Script to generate 'best' chimeric sequences using a beam search.
-The best chimeras is those with the highest conditional likelihood scores.
-"""
 
 @dataclass
 class Beam:
     seq: str
     score: float
-    score_pos : float
+    score_pos: float
     n_switched: bool
     c_switched: bool
-    emitted_len: int  # number of residues actually emitted/scored
+    filled_str: str
+
+    # per-loop accumulators used for ranking (None refs are skipped via counts)
+    dLL_parentA_loop_sum: float = 0.0
+    dLL_parentB_loop_sum: float = 0.0
+    n_parentA_loop: int = 0
+    n_parentB_loop: int = 0
+
+    # optional per-position deltas (debug/trace)
+    dLL_parentA_pos: float = 0.0
+    dLL_parentB_pos: float = 0.0
 
 
-def _allowed_parent_choices(pos: int, beam: Beam,
-                            nterm_positions: Set[int], cterm_positions: Set[int]) -> Tuple[bool, bool]:
+def _allowed_parent_choices(
+    pos: int, beam: Beam, nterm_positions: List[int], cterm_positions: List[int]
+) -> Tuple[bool, bool]:
     allow_A = True
     allow_B = True
     if pos in nterm_positions and beam.n_switched:
@@ -40,14 +43,26 @@ def _allowed_parent_choices(pos: int, beam: Beam,
     return allow_A, allow_B
 
 
-def _update_switch_flags(pos: int, picked_parent: str, beam: Beam,
-                         nterm_positions: Set[int], cterm_positions: Set[int]) -> Tuple[bool, bool]:
+def _update_switch_flags(
+    pos: int, picked_parent: str, beam: Beam, nterm_positions: List[int], cterm_positions: List[int]
+) -> Tuple[bool, bool]:
     n_sw = beam.n_switched
     c_sw = beam.c_switched
     if pos in nterm_positions and (not n_sw) and picked_parent == "B":
         n_sw = True
     if pos in cterm_positions and (not c_sw) and picked_parent == "A":
         c_sw = True
+    return n_sw, c_sw
+
+
+def _normalize_switch_flags(
+    pos: int, n_sw: bool, c_sw: bool, nterm_positions: List[int], cterm_positions: List[int]
+) -> Tuple[bool, bool]:
+    # Only enforce switch constraints while we are inside the constrained region
+    if pos not in nterm_positions:
+        n_sw = False
+    if pos not in cterm_positions:
+        c_sw = False
     return n_sw, c_sw
 
 
@@ -62,12 +77,6 @@ def _score_last_residue_lls(
     start_tokens: Optional[List[int]] = None,
     weights: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-
-    #Need to adapt format?
-    # cand_names, cand_seqs = read_fasta(
-    #     args.candidates_file, keep_insertions=False, to_upper=True
-    # )
-
     # Encode completions with BOS/EOS = [SEP]
     comp_tok = model.tokenizer.encode_completions(
         seqs,
@@ -78,7 +87,7 @@ def _score_last_residue_lls(
         torch.as_tensor(comp_tok["input_ids"], dtype=torch.long)
         .unsqueeze(0)
         .to(model.device)
-    ) # (1, n, L)
+    )  # (1, n, L)
 
     with torch.no_grad():
         _, mean_lls_per_pos, _ = score_variants_ensemble(
@@ -92,29 +101,86 @@ def _score_last_residue_lls(
             weights=weights,
         )
 
+    # last residue before EOS/SEP (your original behavior)
     return mean_lls_per_pos[:, -2].astype(np.float64)
 
-import json
 
-def save_step_jsonl(f, pos, expansions, emit_indices, emit_ll):
-    # Make expansions JSON-friendly (Beam object -> dict)
+def loop_score_A(b: Beam) -> float:
+    # average over positions where parentA exists in this loop
+    return b.dLL_parentA_loop_sum / max(1, b.n_parentA_loop)
+
+
+def loop_score_B(b: Beam) -> float:
+    return b.dLL_parentB_loop_sum / max(1, b.n_parentB_loop)
+
+
+def _dense_ranks(values: List[float], higher_is_better: bool = False) -> Dict[float, int]:
+    uniq = sorted(set(values), reverse=higher_is_better)
+    return {v: i + 1 for i, v in enumerate(uniq)}
+
+
+def select_by_sum_of_ranks_with_ties(
+    beams: List[Beam],
+    beam_width: int,
+    *,
+    higher_is_better: bool = False,
+) -> List[Beam]:
+    """
+    Dense ranks with ties for A and B, then minimize sum(rankA, rankB).
+    Keep top beam_width and include all ties at the cutoff sum-rank.
+    """
+    if not beams:
+        return []
+
+    valsA = [loop_score_A(b) for b in beams]
+    valsB = [loop_score_B(b) for b in beams]
+
+    print(valsA)
+    print(valsB)
+
+    rA = _dense_ranks(valsA, higher_is_better=higher_is_better)
+    rB = _dense_ranks(valsB, higher_is_better=higher_is_better)
+
+    print(rA)
+    print(rB)
+
+    scored = []
+    for b, a, c in zip(beams, valsA, valsB):
+        ra = rA[a]
+        rb = rB[c]
+        scored.append((ra + rb, ra, rb, b))
+
+    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+    print(scored)
+
+    if len(scored) <= beam_width:
+        return [b for *_, b in scored]
+
+    cutoff_sum = scored[beam_width - 1][0]
+    print(cutoff_sum)
+    return [b for (s, _, _, b) in scored if s <= cutoff_sum]
+
+
+def save_step_jsonl(f, pos, expansions, parentA_scores, parentB_scores):
     exp_rows = []
-    for (prev, new_seq, picked_parent, emitted) in expansions:
-        exp_rows.append({
-            "prev_seq": getattr(prev, "seq", None),
-            "prev_score": getattr(prev, "score", None),
-            "prev_emitted_len": getattr(prev, "emitted_len", None),
-            "new_seq": new_seq,
-            "picked_parent": picked_parent,
-            "emitted": emitted,
-        })
+
+    for idx, (prev, new_seq, picked_parent, emitted, filled_str) in enumerate(expansions):
+        exp_rows.append(
+            {
+                "new_seq": new_seq,
+                "picked_parent": picked_parent,
+                "emitted": emitted,
+                "filled_str": filled_str,
+                "dA_pos": None if parentA_scores[idx] is None else float(parentA_scores[idx]),
+                "dB_pos": None if parentB_scores[idx] is None else float(parentB_scores[idx]),
+            }
+        )
 
     rec = {
-        "pos": pos,
+        "pos": int(pos),
         "expansions": exp_rows,
-        "emit_indices": emit_indices,
-        "emit_ll": None if emit_ll is None else [float(x) for x in emit_ll],
     }
+
     f.write(json.dumps(rec) + "\n")
     f.flush()
 
@@ -125,186 +191,206 @@ def beam_search_chimera_template(
     name: str,
     chimera_template: str,
     hole_options: Dict[int, Tuple[Union[str, None], Union[str, None]]],
+    aligned_ll_parentA: List[Optional[float]],
+    aligned_ll_parentB: List[Optional[float]],
     beam_width: int = 16,
-    nterm_positions: Optional[Set[int]] = None,
-    cterm_positions: Optional[Set[int]] = None,
-    tokenized_conditioning_sequences: Optional[List[List[int]]] = None,
+    nterm_positions: List[int],
+    cterm_positions: List[int],
+    tokenized_conditioning_sequences_parentA: Optional[List[List[int]]] = None,
+    tokenized_conditioning_sequences_parentB: Optional[List[List[int]]] = None,
     ensemble_size: Optional[int] = None,
     scoring_max_tokens: int = 64000,
     max_tokens_override: int = 8192,
     start_tokens: Optional[List[int]] = None,
-    weights: Optional[np.ndarray] = None,
-    margin: Optional[float] = None
-) -> List[Tuple[str, float, float, int]]:
+    weights_parentA: Optional[np.ndarray] = None,
+    weights_parentB: Optional[np.ndarray] = None,
+) -> List[Beam]:
     """
-    Supports empty options at '_' holes:
-      option == '' or None => emit nothing (sequence shortens), no model score added.
+    Beam search over a chimera template with '_' holes.
+    At the end of each *loop* (a consecutive run of holes), prune using:
+      - dense rank under reference A loop score
+      - dense rank under reference B loop score
+      - minimize sum of ranks
+      - keep top beam_width and include ties at cutoff
+    Loop scores are computed only over positions where the reference has a value (None is skipped).
 
-    Returns a list of:
-      (sequence, total_score, avg_score_per_emitted_residue, emitted_len)
-    sorted best-first by `rank_by`.
+    Returns remaining beams (you can post-process into sequences/summaries).
     """
-    nterm_positions = nterm_positions or set()
-    cterm_positions = cterm_positions or set()
-
     L = len(chimera_template)
 
+    # loop ends: end of each consecutive run of hole positions
+    holes = sorted(hole_options.keys())
+    loop_end_holes = set()
+    for i, h in enumerate(holes):
+        if i == len(holes) - 1 or holes[i + 1] != h + 1:
+            loop_end_holes.add(h)
+
+    # validate hole options
     for pos, (a, b) in hole_options.items():
         if not (0 <= pos < L):
             raise ValueError(f"hole_options position {pos} out of range (len={L})")
         if chimera_template[pos] != "_":
-            raise ValueError(f"hole_options has pos {pos} but template at pos is '{chimera_template[pos]}', not '_'")
-
-        # allow None for gaps; otherwise must be single residue
+            raise ValueError(
+                f"hole_options has pos {pos} but template at pos is '{chimera_template[pos]}', not '_'"
+            )
         for opt in (a, b):
             if opt is None:
                 continue
             if len(opt) != 1:
                 raise ValueError(f"Options at pos {pos} must be single residues or empty, got {opt!r}")
 
-    beams: List[Beam] = [Beam(seq="", score=0.0,score_pos=0.0, n_switched=False, c_switched=False, emitted_len=0)] 
+    if len(aligned_ll_parentA) != L or len(aligned_ll_parentB) != L:
+        raise ValueError("aligned_ll_parentA/B must have length equal to len(chimera_template)")
 
-    with open(f"beam_trace_{name}.jsonl", "w") as trace_f:
+    beams: List[Beam] = [
+        Beam(seq="", score=0.0, score_pos=0.0, n_switched=False, c_switched=False, filled_str="")
+    ]
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    with open(f"beam_trace_{name}_{beam_width}_{ts}.jsonl", "w") as trace_f:
         for pos in range(L):
             template_char = chimera_template[pos]
 
-            # expansions entries:
-            # (prev_beam, new_seq, picked_parent, emitted_residue_or_none)
-            expansions: List[Tuple[Beam, str, Optional[str], Optional[str]]] = []
+            # expansions entries: (prev_beam, new_seq, picked_parent, emitted_residue_or_none, filled_str)
+            expansions: List[Tuple[Beam, str, Optional[str], Optional[str], str]] = []
 
             if template_char != "_":
-                # Fixed residue: always emit and score
-                # for b in beams:
-                #     expansions.append((b, b.seq + template_char, None, template_char))
+                # fixed residue: you currently do NOT score it (keeps ll/deltas unchanged)
                 for b in beams:
-                    expansions.append((b, b.seq + template_char, None, None))
+                    expansions.append((b, b.seq + template_char, None, None, b.filled_str))
             else:
-                # Hole: choose option A or B, either can be residue or empty
+                # hole: choose A or B (residue or deletion)
                 optA, optB = hole_options[pos]
                 for b in beams:
                     allow_A, allow_B = _allowed_parent_choices(pos, b, nterm_positions, cterm_positions)
 
                     if allow_A:
                         if optA is None:
-                            expansions.append((b, b.seq, "A", None))       # deletion
+                            expansions.append((b, b.seq, "A", None, b.filled_str + "A"))  # deletion
                         else:
-                            expansions.append((b, b.seq + optA, "A", optA))  # emit residue
+                            expansions.append((b, b.seq + optA, "A", optA, b.filled_str + "A"))
 
                     if allow_B:
                         if optB is None:
-                            expansions.append((b, b.seq, "B", None))
+                            expansions.append((b, b.seq, "B", None, b.filled_str + "B"))
                         else:
-                            expansions.append((b, b.seq + optB, "B", optB))
+                            expansions.append((b, b.seq + optB, "B", optB, b.filled_str + "B"))
 
             if not expansions:
                 raise RuntimeError(f"No valid expansions at position {pos} under the prior.")
 
             # Score only expansions that emitted a residue
-            emit_indices = [i for i, (_, _, _, emitted) in enumerate(expansions) if emitted is not None]
+            emit_indices = [i for i, (_, _, _, emitted, _) in enumerate(expansions) if emitted is not None]
             emit_seqs = [expansions[i][1] for i in emit_indices]
 
-            emit_ll = None
+            emit_ll_parentA, emit_ll_parentB = None, None
             if emit_seqs:
-                emit_ll = _score_last_residue_lls(
+                emit_ll_parentA = _score_last_residue_lls(
                     model,
                     emit_seqs,
-                    tokenized_conditioning_sequences=tokenized_conditioning_sequences,
+                    tokenized_conditioning_sequences=tokenized_conditioning_sequences_parentA,
                     ensemble_size=ensemble_size,
                     scoring_max_tokens=scoring_max_tokens,
                     max_tokens_override=max_tokens_override,
-                    start_tokens=[47, 63],
-                    weights=weights,
+                    start_tokens=start_tokens,
+                    weights=weights_parentA,
                 )
 
-            # Build ll aligned to expansions (same length as expansions)
-            ll_by_exp = np.full(len(expansions), np.nan, dtype=float)
-            if emit_ll is not None:
+                emit_ll_parentB = _score_last_residue_lls(
+                    model,
+                    emit_seqs,
+                    tokenized_conditioning_sequences=tokenized_conditioning_sequences_parentB,
+                    ensemble_size=ensemble_size,
+                    scoring_max_tokens=scoring_max_tokens,
+                    max_tokens_override=max_tokens_override,
+                    start_tokens=start_tokens,
+                    weights=weights_parentB,
+                )
+
+            ll_by_exp_parentA = np.full(len(expansions), np.nan, dtype=float)
+            if emit_ll_parentA is not None:
                 for j, exp_i in enumerate(emit_indices):
-                    ll_by_exp[exp_i] = float(emit_ll[j])
+                    ll_by_exp_parentA[exp_i] = float(emit_ll_parentA[j])
 
-            # Optional margin filtering (per previous beam, only at '_' positions)
-            keep_mask = np.ones(len(expansions), dtype=bool)
+            ll_by_exp_parentB= np.full(len(expansions), np.nan, dtype=float)
+            if emit_ll_parentB is not None:
+                for j, exp_i in enumerate(emit_indices):
+                    ll_by_exp_parentB[exp_i] = float(emit_ll_parentB[j])
 
-            if margin is not None:
-                by_prev = {}
-                for i, (prev, _, picked_parent, emitted) in enumerate(expansions):
-                    if picked_parent is None:
-                        continue  # fixed position
-                    # only margin-compare among options that actually emitted (have a ll)
-                    if emitted is None:
-                        continue
-                    by_prev.setdefault(id(prev), []).append(i)
-
-                for _, idxs in by_prev.items():
-                    best = float(np.nanmax(ll_by_exp[idxs]))
-                    for i in idxs:
-                        if best - ll_by_exp[i] > float(margin):
-                            keep_mask[i] = False
-
-            # Save trace
-            save_step_jsonl(trace_f, pos, expansions, emit_indices, emit_ll,keep_mask)
-
-            # Build new beams from kept expansions
+            # Build new beams from expansions
             new_beams: List[Beam] = []
-            emit_cursor = 0 
-
-            for i, (prev, new_seq, picked_parent, emitted) in enumerate(expansions):
-                if not keep_mask[i]:
-                    continue
-
+            parentA_ref = aligned_ll_parentA[pos]  # can be None
+            parentB_ref = aligned_ll_parentB[pos]  # can be None
+            parentA_scores = []
+            parentB_scores = []
+            for i, (prev, new_seq, picked_parent, emitted, filled_str) in enumerate(expansions):
                 if picked_parent is None:
                     n_sw, c_sw = prev.n_switched, prev.c_switched
                 else:
                     n_sw, c_sw = _update_switch_flags(pos, picked_parent, prev, nterm_positions, cterm_positions)
 
+                n_sw, c_sw = _normalize_switch_flags(pos, n_sw, c_sw, nterm_positions, cterm_positions)
+
                 if emitted is None:
-                    # fixed residue (you currently treat as emitted=None) OR deletion -> no score
-                    new_beams.append(
-                        Beam(seq=new_seq, score=prev.score, score_pos=0.0,
-                            n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len)
-                    )
+                    ll = 0.0
+                    dA = None
+                    dB = None
+                    addA = 0
+                    addB = 0
                 else:
-                    ll = float(emit_ll[emit_cursor])
-                    emit_cursor += 1
-                    new_beams.append(
-                        Beam(seq=new_seq, score=prev.score + ll, score_pos=ll,
-                            n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len + 1)
+                    ll_parentA = float(ll_by_exp_parentA[i])
+                    ll_parentB = float(ll_by_exp_parentB[i])
+
+                    if parentA_ref is None:
+                        dA = None
+                        addA = 0
+                    else:
+                        dA = ll_parentA - float(parentA_ref)
+                        addA = 1
+
+                    if parentB_ref is None:
+                        dB = None
+                        addB = 0
+                    else:
+                        dB = ll_parentB - float(parentB_ref)
+                        addB = 1
+
+                # ALWAYS append one entry per expansion
+                parentA_scores.append(dA)
+                parentB_scores.append(dB)
+
+                new_beams.append(
+                    Beam(
+                        seq=new_seq,
+                        score=prev.score + ll,
+                        score_pos=ll,
+                        n_switched=n_sw,
+                        c_switched=c_sw,
+                        filled_str=filled_str,
+                        dLL_parentA_loop_sum=prev.dLL_parentA_loop_sum + (dA or 0.0),
+                        dLL_parentB_loop_sum=prev.dLL_parentB_loop_sum + (dB or 0.0),
+                        n_parentA_loop=prev.n_parentA_loop + addA,
+                        n_parentB_loop=prev.n_parentB_loop + addB,
+                        dLL_parentA_pos=dA or 0.0,
+                        dLL_parentB_pos=dB or 0.0,
                     )
-
-            # Fallback: if everything filtered out, do NOT dead-end
-            if not new_beams:
-                new_beams = []
-                emit_cursor = 0
-                for i, (prev, new_seq, picked_parent, emitted) in enumerate(expansions):
-                    if picked_parent is None:
-                        n_sw, c_sw = prev.n_switched, prev.c_switched
-                    else:
-                        n_sw, c_sw = _update_switch_flags(pos, picked_parent, prev, nterm_positions, cterm_positions)
-
-                    if emitted is None:
-                        new_beams.append(
-                            Beam(seq=new_seq, score=prev.score, score_pos=0.0,
-                                n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len)
-                        )
-                    else:
-                        ll = float(emit_ll[emit_cursor])
-                        emit_cursor += 1
-                        new_beams.append(
-                            Beam(seq=new_seq, score=prev.score + ll, score_pos=ll,
-                                n_switched=n_sw, c_switched=c_sw, emitted_len=prev.emitted_len + 1)
-                        )
-
+                )
+                            
+            save_step_jsonl(trace_f, pos, expansions, parentA_scores, parentB_scores )
             beams = new_beams
 
-    # Final ranking
-    out = []
-    for b in beams:
-        avg = b.score / max(1, b.emitted_len)
-        out.append((b.seq, b.score, avg, b.emitted_len))
+            # Prune only at end of a loop (end of a consecutive hole run)
+            if pos in loop_end_holes:
+                beams = select_by_sum_of_ranks_with_ties(beams, beam_width, higher_is_better=False)
 
+                # reset per-loop accumulators for next loop
+                for b in beams:
+                    b.dLL_parentA_loop_sum = 0.0
+                    b.dLL_parentB_loop_sum = 0.0
+                    b.n_parentA_loop = 0
+                    b.n_parentB_loop = 0
 
-    out.sort(key=lambda x: x[2], reverse=True)  # average per emitted residue
-    return out
+    return beams
 
 
 def main():
